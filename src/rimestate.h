@@ -7,11 +7,16 @@
 #define _FCITX_RIMESTATE_H_
 
 #include "rimesession.h"
+#include <fcitx/event.h>
 #include <fcitx/globalconfig.h>
 #include <fcitx/inputcontextmanager.h>
 #include <fcitx/inputcontextproperty.h>
+#include <functional>
 #include <memory>
 #include <rime_api.h>
+#include <string>
+#include <string_view>
+#include <vector>
 
 #define RIME_ASCII_MODE "ascii_mode"
 
@@ -26,9 +31,13 @@ public:
     virtual ~RimeState();
 
     void clear();
+    void activate();
     void keyEvent(KeyEvent &event);
 #ifndef FCITX_RIME_NO_SELECT_CANDIDATE
     void selectCandidate(InputContext *inputContext, int idx, bool global);
+#endif
+#ifndef FCITX_RIME_NO_DELETE_CANDIDATE
+    void deleteCandidate(int idx, bool global);
 #endif
     bool getStatus(const std::function<void(const RimeStatus &)> &);
     void updatePreedit(InputContext *ic, const RimeContext &context);
@@ -44,8 +53,14 @@ public:
 
     void snapshot();
     void restore();
+    std::string currentSchema();
+    void addChangedOption(std::string_view option);
+    void showChangedOptions();
 
 private:
+    void maybeSyncProgramNameToSession();
+    std::vector<std::string> snapshotOptions(const std::string &schema);
+
     std::string lastMode_;
     RimeEngine *engine_;
     InputContext &ic_;
@@ -53,6 +68,7 @@ private:
 
     std::string savedCurrentSchema_;
     std::vector<std::string> savedOptions_;
+    std::vector<std::string> changedOptions_;
 };
 } // namespace fcitx
 

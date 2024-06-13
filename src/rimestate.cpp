@@ -5,8 +5,11 @@
  */
 
 #include "rimestate.h"
+#include "rimeaction.h"
 #include "rimecandidate.h"
 #include "rimeengine.h"
+#include "rimesession.h"
+#include <algorithm>
 #include <cstdint>
 #include <fcitx-utils/capabilityflags.h>
 #include <fcitx-utils/i18n.h>
@@ -18,16 +21,21 @@
 #include <fcitx/candidatelist.h>
 #include <fcitx/event.h>
 #include <fcitx/inputcontext.h>
+#include <fcitx/inputcontextmanager.h>
 #include <fcitx/inputpanel.h>
 #include <fcitx/text.h>
 #include <fcitx/userinterface.h>
 #include <functional>
 #include <iterator>
+#include <list>
 #include <memory>
 #include <optional>
 #include <rime_api.h>
 #include <string>
+#include <string_view>
+#include <unordered_set>
 #include <utility>
+#include <vector>
 
 namespace fcitx {
 
@@ -38,6 +46,7 @@ bool emptyExceptAux(const InputPanel &inputPanel) {
     return inputPanel.preedit().empty() && inputPanel.preedit().empty() &&
            (!inputPanel.candidateList() || inputPanel.candidateList()->empty());
 }
+
 } // namespace
 
 RimeState::RimeState(RimeEngine *engine, InputContext &ic)
@@ -69,6 +78,8 @@ void RimeState::clear() {
         engine_->api()->clear_composition(session);
     }
 }
+
+void RimeState::activate() { maybeSyncProgramNameToSession(); }
 
 std::string RimeState::subMode() {
     std::string result;
@@ -104,6 +115,16 @@ std::string RimeState::subModeLabel() {
     return result;
 }
 
+std::string RimeState::currentSchema() {
+    std::string schema;
+    getStatus([&schema](const RimeStatus &status) {
+        if (status.schema_id) {
+            schema = status.schema_id;
+        }
+    });
+    return schema;
+}
+
 void RimeState::toggleLatinMode() {
     auto *api = engine_->api();
     if (api->is_maintenance_mode()) {
@@ -127,12 +148,12 @@ void RimeState::selectSchema(const std::string &schema) {
     if (api->is_maintenance_mode()) {
         return;
     }
-    engine_->blockNotificationFor(30000);
     api->set_option(session(), RIME_ASCII_MODE, false);
     api->select_schema(session(), schema.data());
 }
 
 void RimeState::keyEvent(KeyEvent &event) {
+    changedOptions_.clear();
     auto *ic = event.inputContext();
     // For key-release, composeResult will always be empty string, which feed
     // into engine directly.
@@ -158,7 +179,10 @@ void RimeState::keyEvent(KeyEvent &event) {
         return;
     }
 
+    maybeSyncProgramNameToSession();
     lastMode_ = subMode();
+
+    std::string lastSchema = currentSchema();
     auto states = event.rawKey().states() &
                   KeyStates{KeyState::Mod1, KeyState::CapsLock, KeyState::Shift,
                             KeyState::Ctrl, KeyState::Super};
@@ -203,6 +227,11 @@ void RimeState::keyEvent(KeyEvent &event) {
     }
 
     updateUI(ic, event.isRelease());
+    if (!event.isRelease() && !lastSchema.empty() &&
+        lastSchema == currentSchema() && ic->inputPanel().empty() &&
+        !changedOptions_.empty()) {
+        showChangedOptions();
+    }
 }
 
 #ifndef FCITX_RIME_NO_SELECT_CANDIDATE
@@ -227,6 +256,25 @@ void RimeState::selectCandidate(InputContext *inputContext, int idx,
         api->free_commit(&commit);
     }
     updateUI(inputContext, false);
+}
+#endif
+
+#ifndef FCITX_RIME_NO_DELETE_CANDIDATE
+void RimeState::deleteCandidate(int idx, bool global) {
+    auto *api = engine_->api();
+    if (api->is_maintenance_mode()) {
+        return;
+    }
+    auto session = this->session();
+    if (!session) {
+        return;
+    }
+    if (global) {
+        api->delete_candidate(session, idx);
+    } else {
+        api->delete_candidate_on_current_page(session, idx);
+    }
+    updateUI(&ic_, false);
 }
 #endif
 
@@ -368,7 +416,7 @@ void RimeState::updateUI(InputContext *ic, bool keyRelease) {
         }
 
         api->free_context(&context);
-    } while (0);
+    } while (false);
 
     ic->updatePreedit();
     // HACK: for show input method information.
@@ -381,7 +429,6 @@ void RimeState::updateUI(InputContext *ic, bool keyRelease) {
         inputPanel.setAuxDown(Text());
     }
     if (newEmptyExceptAux && lastMode_ != subMode()) {
-        engine_->blockNotificationFor(30000);
         engine_->instance()->showInputMethodInformation(ic);
         ic->updateUserInterface(UserInterfaceComponent::StatusArea);
     }
@@ -420,17 +467,27 @@ void RimeState::snapshot() {
         if (savedCurrentSchema_.empty()) {
             return;
         }
-        const auto &optionActions = engine_->optionActions();
-        auto iter = optionActions.find(savedCurrentSchema_);
-        if (iter == optionActions.end()) {
-            return;
-        }
-        for (const auto &option : iter->second) {
-            if (auto savedOption = option->snapshotOption(&ic_)) {
-                savedOptions_.push_back(std::move(*savedOption));
-            }
-        }
+
+        savedOptions_ = snapshotOptions(savedCurrentSchema_);
     });
+}
+
+std::vector<std::string> RimeState::snapshotOptions(const std::string &schema) {
+    if (schema.empty()) {
+        return {};
+    }
+    std::vector<std::string> savedOptions;
+    const auto &optionActions = engine_->optionActions();
+    auto iter = optionActions.find(schema);
+    if (iter == optionActions.end()) {
+        return {};
+    }
+    for (const auto &option : iter->second) {
+        if (auto savedOption = option->snapshotOption(&ic_)) {
+            savedOptions.push_back(std::move(*savedOption));
+        }
+    }
+    return savedOptions;
 }
 
 void RimeState::restore() {
@@ -451,4 +508,91 @@ void RimeState::restore() {
     }
 }
 
+void RimeState::maybeSyncProgramNameToSession() {
+    // The program name is guranteed to be const through the Input Context
+    // lifetime. There is no need to update it if the policy is not "All".
+    if (engine_->sessionPool().propertyPropagatePolicy() !=
+        PropertyPropagatePolicy::All) {
+        return;
+    }
+
+    if (session_) {
+        session_->setProgramName(ic_.program());
+    }
+}
+
+void RimeState::addChangedOption(std::string_view option) {
+    changedOptions_.push_back(std::string(option));
+}
+void RimeState::showChangedOptions() {
+
+    std::string schema = currentSchema();
+    if (schema.empty()) {
+        return;
+    }
+    const auto &optionActions = engine_->optionActions();
+    auto iter = optionActions.find(schema);
+    if (iter == optionActions.end()) {
+        return;
+    }
+    const auto &actions = iter->second;
+
+    std::string labels;
+    std::unordered_set<RimeOptionAction *> actionSet;
+    std::vector<RimeOptionAction *> actionList;
+
+    auto extractOptionName = [](std::string_view &option) {
+        const bool state = (option.front() != '!');
+        if (!state) {
+            option.remove_prefix(1);
+        }
+        return state;
+    };
+
+    for (std::string_view option : changedOptions_) {
+        if (option.empty()) {
+            continue;
+        }
+        extractOptionName(option);
+        // Skip internal options.
+        if (stringutils::startsWith(option, "_")) {
+            continue;
+        }
+
+        // This is hard coded latin-mode.
+        if (option == "ascii_mode") {
+            continue;
+        }
+
+        // Filter by action, so we know this option belongs to current schema.
+        auto actionIter = std::find_if(
+            actions.begin(), actions.end(),
+            [option](const std::unique_ptr<RimeOptionAction> &action) {
+                return action->checkOptionName(option);
+            });
+        if (actionIter == actions.end()) {
+            continue;
+        }
+        if (actionSet.count(actionIter->get())) {
+            continue;
+        }
+        actionSet.insert(actionIter->get());
+        actionList.push_back(actionIter->get());
+    }
+
+    for (auto *action : actionList) {
+        // Snapshot again, so SelectAction will return the current active value.
+        auto label = action->optionLabel(&ic_);
+        if (label.empty()) {
+            continue;
+        }
+        if (!labels.empty()) {
+            labels.append("|");
+        }
+        labels.append(label);
+    }
+    if (!labels.empty()) {
+        engine_->instance()->showCustomInputMethodInformation(&ic_, labels);
+    }
+}
 } // namespace fcitx
